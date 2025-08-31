@@ -5,13 +5,16 @@ import requests
 import traceback
 from datetime import datetime
 import time
+import base64
+import json
 import my_pb2
 from key_iv import AES_KEY, AES_IV
 
 app = Flask(__name__)
 session = requests.Session()
 
-DATA_API = "https://client.ind.freefiremobile.com/UpdateSocialBasicInfo"
+# ✅ BD (Blueshark) API
+DATA_API = "https://clientbp.ggblueshark.com/UpdateSocialBasicInfo"
 
 HEADERS_TEMPLATE = {
     "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
@@ -28,23 +31,19 @@ def encrypt_message(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
     cipher = AES.new(key, AES.MODE_CBC, iv)
     return cipher.encrypt(pad(plaintext, AES.block_size))
 
-def build_signature(uid: str, region: str, bio: str) -> my_pb2.Signature:
+def build_signature(uid: int, region: str, bio: str) -> my_pb2.Signature:
     msg = my_pb2.Signature()
     msg.field2 = 9
-
-    # UID as int (agar number hai)
     msg.field5 = int(uid)
 
-    # Region ko ab string treat karo
-    # Agar pb2 ka type int64 hai to safe rakhne ke liye
-    # ek mapping use karna hoga
     region_map = {
         "ind": 101,
         "br": 102,
         "sg": 103,
         "us": 104,
+        "bd": 105,
     }
-    msg.field6 = region_map.get(region.lower(), 0)
+    msg.field6 = region_map.get(region.lower(), 104)
 
     msg.field8 = bio
     msg.field9 = 1
@@ -52,59 +51,59 @@ def build_signature(uid: str, region: str, bio: str) -> my_pb2.Signature:
     msg.field12 = int(datetime.now().strftime("%Y%m%d%H%M%S"))
     return msg
 
-@app.route("/update_bio", methods=["GET"])
+def decode_jwt_payload(token: str) -> dict:
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {}
+        payload_b64 = parts[1]
+        padding = "=" * (-len(payload_b64) % 4)
+        decoded = base64.urlsafe_b64decode(payload_b64 + padding)
+        return json.loads(decoded.decode("utf-8"))
+    except Exception as e:
+        print("JWT decode error:", e)
+        return {}
+
+@app.route("/bio", methods=["GET"])
 def send_bio():
     try:
         token = request.args.get("token")
         bio = request.args.get("bio")
-        uid = request.args.get("uid")
-        region = request.args.get("region")
 
-        # Basic validation
         if not token or not bio:
-            return jsonify({"status": "error", "message": "Missing 'token' or 'bio' parameter"}), 400
-        if not uid or not region:
-            return jsonify({"status": "error", "message": "Missing 'uid' or 'region' parameter"}), 400
-
-        # Optional: Bio length guard (adjust if server requires stricter)
+            return jsonify({"status": "error", "message": "Missing 'token' or 'bio'"}), 400
         if len(bio) > 80:
-            return jsonify({"status": "error", "message": "bio too long (max 80 chars recommended)"}), 400
+            return jsonify({"status": "error", "message": "bio too long (max 80 chars)"}), 400
+
+        # JWT থেকে uid আর region বের করা
+        payload = decode_jwt_payload(token)
+        uid = payload.get("account_id", 0)
+        region = payload.get("country_code", "us")
 
         # Build protobuf
-        msg = build_signature(int(uid), int(region), bio)
+        msg = build_signature(uid, region, bio)
         serialized = msg.SerializeToString()
-
-        # Encrypt
         encrypted = encrypt_message(AES_KEY, AES_IV, serialized)
 
-        # Headers
         headers = HEADERS_TEMPLATE.copy()
-        # Ensure "Bearer " not duplicated
-        headers["Authorization"] = token if token.strip().lower().startswith("bearer ") else f"Bearer {token}"
+        headers["Authorization"] = token if token.lower().startswith("bearer ") else f"Bearer {token}"
 
-        # Send
-        resp = session.post(
-            DATA_API,
-            data=encrypted,
-            headers=headers,
-            verify=False,
-            timeout=20,
-        )
+        resp = session.post(DATA_API, data=encrypted, headers=headers, verify=False, timeout=20)
 
-        # Try decode; keep raw on failure
         try:
-            server_text = resp.content.decode("utf-8", errors="strict")
+            server_text = resp.content.decode("utf-8")
         except UnicodeDecodeError:
             server_text = resp.content.decode("latin1", errors="ignore")
 
-        # Smarter status mapping
         lower_text = server_text.lower().strip()
         is_ok = (200 <= resp.status_code < 300) and ("invalid" not in lower_text)
 
-        # Debug snapshot (helps you compare with real client)
         debug = {
+            "uid_used": uid,
+            "region_used": region,
             "encrypted_len": len(encrypted),
-            "encrypted_prefix_hex": encrypted[:16].hex(),  # first block
+            "encrypted_prefix_hex": encrypted[:16].hex(),
+            "raw_response_hex": resp.content.hex()[:80]
         }
 
         now = datetime.now().strftime("%H:%M:%S %d/%m/%Y")
@@ -121,5 +120,5 @@ def send_bio():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == "__main__":
-    # NOTE: never expose in prod
     app.run(host="0.0.0.0", port=5000)
+    
